@@ -2,6 +2,8 @@ import os
 os.environ['DDE_BACKEND'] = 'tensorflow.compat.v1'
 import numpy as np
 import tensorflow.compat.v1 as tf
+import tensorflow_probability as tfp
+from scipy.interpolate import griddata
 from multiprocessing import Pool
 
 
@@ -18,138 +20,245 @@ def apply(func, args=None, kwds=None):
     return r
 
 
-def gelu(x):
-    return 0.5 * x * (1 + tf.math.tanh(tf.math.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+def combined_train(repeat, ls_test, num_train, lr=1e-3, pde_weight=1.0, data_weight=0,
+                   model_restore_path="model/model"):
+    """
+    Combined方法：同时使用物理约束(PDE)和数据约束(观测数据)
 
-
-def dirichlet(inputs, outputs):
-    x_trunk = inputs[1]
-    x, t = x_trunk[:, 0:1], x_trunk[:, 1:2]
-    return 10 * x * (1 - x) * t * (outputs + 1)
-
-
-def combined_train(repeat, ls_test, num_train, lr=1e-3, pde_weight=1.0, data_weight=0.3,
-                   model_restore_path="model/model", trainable_branch=True, trainable_trunk=[True, True, True]):
-    """Train DeepONet with both PDE residual loss and observation data loss.
-
-    Approach:
-    - Build a training dataset where the first part are collocation points (used for PDE residual)
-      and the last `num_train` points are observed (supervised) points.
-    - Implement a custom Data subclass whose `losses` computes MSE(residual, 0) + data_weight*MSE(data_pred, data_true).
+    核心思路（参考FT_Phys + FT_Obs_T）：
+    1. 使用TimePDE处理PDE残差（来自FT_Phys）
+    2. 在batch中同时包含PDE配点和观测点（来自FT_Obs_T的思路）
+    3. 对PDE配点应用PDE loss，对观测点应用data loss
     """
     import deepxde as dde
 
+    def gelu(x):
+        return 0.5 * x * (1 + tf.math.tanh(tf.math.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+
+    def dirichlet(inputs, outputs):
+        x_trunk = inputs[1]
+        x, t = x_trunk[:, 0:1], x_trunk[:, 1:2]
+        return 10 * x * (1 - x) * t * (outputs + 1)
+
+    # 加载观测数据
+    data_test = np.load(f"../../../data/diffusion_reaction/dr_test_ls_{ls_test}_num_{num_train}.npz")
+    sensor_value = data_test['x_branch_test'][repeat]
+    X_obs_trunk = data_test['x_trunk_test_select'][repeat]  # (num_train, 2)
+    y_obs = data_test['y_test_select'][repeat].reshape(-1, 1)  # (num_train, 1)
+    X_obs_branch = np.tile(sensor_value, [num_train, 1])
+    xt = np.array([[a, b] for a in np.linspace(0, 1, 101) for b in np.linspace(0, 1, 101)])
+
+    # PDE定义（物理约束，来自FT_Phys）
     def pde(x, y):
-        # x: [x, t]
+        """
+        反应-扩散方程的PDE残差
+        dy/dt = 0.01 * d²y/dx² + 0.01 * y² + z(x)
+        """
         dy = tf.gradients(y, x)[0]
         dy_x, dy_t = dy[:, 0:1], dy[:, 1:]
         dy_xx = tf.gradients(dy_x, x)[0][:, 0:1]
-        z = tf.zeros_like(x[:, :1])
-        return dy_t - 0.01 * dy_xx - 0.01 * y ** 2 - z
+        z = tfp.math.batch_interp_regular_1d_grid(x[:, :1], 0, 1, np.float32(sensor_value))
+        residual = dy_t - 0.01 * dy_xx - 0.01 * y ** 2 - z
+        return residual
 
-    class CombinedData(dde.data.data.Data):
-        def __init__(self, X_train, y_train, X_test, y_test, num_train_obs):
-            # X_train: tuple (branch_array, trunk_array)
-            self.train_x = X_train
-            self.train_y = y_train
-            self.test_x = X_test
-            self.test_y = y_test
-            self.num_obs = num_train_obs
-            # sampler for the collocation (non-observed) part
-            self.train_sampler = dde.data.sampler.BatchSampler(len(self.train_y) - self.num_obs, shuffle=True)
+    def func(x_input):
+        # 用于生成训练数据的函数（虽然我们主要用观测数据，但TimePDE需要这个）
+        uu = data_test['y_test'][repeat].reshape(-1, 1)
+        return griddata(xt, uu, x_input, method="cubic")
 
-        def losses(self, targets, outputs, loss_fn, inputs, model, aux=None):
-            # targets, outputs: tensors for the whole batch (collocation + obs)
-            # inputs is a tuple/list where inputs[1] is the trunk input (x,t)
-            # Compute PDE residual on entire batch and supervise only on last self.num_obs samples
-            y_pred = outputs
-            x_trunk = inputs[1]
+    # 创建TimePDE（会自动处理PDE梯度计算）
+    geom = dde.geometry.Interval(0, 1)
+    timedomain = dde.geometry.TimeDomain(0, 1)
+    geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+    data_pde = dde.data.TimePDE(geomtime, pde, [], num_domain=1000, solution=func, num_test=10000)
 
-            # PDE residual (use same pde as in FT_Phys)
-            residual = pde(x_trunk, y_pred)
-            pde_loss = dde.losses.mean_squared_error(residual, tf.zeros_like(residual))
+    # ===== 关键修改：修改 train_next_batch 而不是 train_points =====
+    # 这样可以确保每个 batch 都包含所有观测点（参考 FT_Obs_T 的实现）
 
-            # supervised data loss: compare only the last self.num_obs entries
-            if self.num_obs > 0:
-                data_pred = y_pred[-self.num_obs:]
-                data_true = targets[-self.num_obs:]
-                data_loss = dde.losses.mean_squared_error(data_pred, data_true)
+    # 保存原始方法
+    original_losses = data_pde.losses
+    original_train_next_batch = data_pde.train_next_batch
+
+    # 修改 train_next_batch：每个 batch 从配点中采样 + 添加所有观测点
+    def combined_train_next_batch(batch_size=None):
+        """
+        每个 batch 的组成：
+        - 从 1000 个 PDE 配点中采样 batch_size 个
+        - 添加所有 100 个观测点
+        - 总共：batch_size + 100 个点
+
+        返回：(train_x, train_y, train_aux_vars) tuple
+        """
+        # 获取配点的 batch - 返回 (X, y, aux) tuple
+        colloc_batch_tuple = original_train_next_batch(batch_size)
+        colloc_x, colloc_y, colloc_aux = colloc_batch_tuple
+
+        # 添加所有观测点
+        if data_weight > 0:
+            # 合并 trunk coordinates
+            combined_x = np.vstack([colloc_x, X_obs_trunk])
+            # 合并 y（观测点的 y 已知）
+            combined_y = np.vstack([colloc_y, y_obs]) if colloc_y is not None else None
+            # aux_vars 保持 None
+            combined_aux = None
+
+            return combined_x, combined_y, combined_aux
+        else:
+            # 如果 data_weight=0，不添加观测点，保持与原始 TimePDE 完全一致
+            return colloc_batch_tuple
+
+    # 替换方法
+    data_pde.train_next_batch = combined_train_next_batch
+
+    y_obs_tensor = tf.convert_to_tensor(y_obs, dtype=tf.float32)
+
+    def combined_losses(targets, outputs, loss_fn, inputs, model, aux=None):
+        """
+        关键修改：返回 list 而不是标量，与原始 TimePDE.losses 的格式一致
+
+        原始 TimePDE.losses 返回：
+        - [pde_loss_1, pde_loss_2, ..., bc_loss_1, bc_loss_2, ...]
+
+        我们的 combined 返回：
+        - 当 data_weight=0: [pde_loss]  (与原始一致)
+        - 当 data_weight>0: [pde_loss, data_loss]
+        """
+
+        # ===== 计算 loss =====
+        total = tf.shape(outputs)[0]
+
+        if data_weight == 0.0:
+            # 纯 PDE 模式：完全模仿原始 TimePDE.losses 的行为
+            # 1. 调用 pde 函数获取残差（inputs 只包含 trunk，因为是普通 PDE）
+            pde_residual = pde(inputs, outputs)
+
+            # 2. 使用 loss_fn 计算 loss（与原始一致）
+            # 原始代码：loss_fn[i](bkd.zeros_like(error), error)
+            if isinstance(loss_fn, (list, tuple)):
+                pde_loss = loss_fn[0](tf.zeros_like(pde_residual), pde_residual)
             else:
-                data_loss = tf.constant(0.0, dtype=tf.float32)
+                pde_loss = loss_fn(tf.zeros_like(pde_residual), pde_residual)
 
-            return pde_weight * pde_loss + data_weight * data_loss
+            # 3. 返回 list（与原始格式一致）
+            return [pde_loss]
 
-        def train_next_batch(self, batch_size=None):
-            # Return a batch containing a subset of collocation points plus all observed points
-            if batch_size is None:
-                return self.train_x, self.train_y
-            indices = self.train_sampler.get_next(batch_size)
-            branch = np.concatenate([self.train_x[0][indices], self.train_x[0][-self.num_obs:]], axis=0)
-            trunk = np.concatenate([self.train_x[1][indices], self.train_x[1][-self.num_obs:]], axis=0)
-            y = np.concatenate([self.train_y[indices], self.train_y[-self.num_obs:]], axis=0)
-            return (branch, trunk), y
+        else:
+            # 组合模式
+            num_obs = tf.constant(num_train, dtype=tf.int32)
+            colloc_count = total - num_obs
 
-        def test(self):
-            return self.test_x, self.test_y
+            # 1. PDE loss：只对前面的配点计算
+            # 关键问题：PDE 需要用完整的 inputs 来保持梯度连接
+            # 我们不能切片 inputs，而是在 PDE residual 中只使用前面的部分
 
-    # load test data and observation
-    data_test = np.load(f"../../../data/diffusion_reaction/dr_test_ls_{ls_test}_num_{num_train}.npz")
-    sensor_value = data_test['x_branch_test'][repeat]
-    X_train_branch_addition = np.tile(sensor_value, [num_train, 1])
-    X_train_trunk_addition = data_test['x_trunk_test_select'][repeat]
-    y_train_addition = data_test['y_test_select'][repeat]
+            # 调用 PDE 在完整 inputs 上（保持梯度连接）
+            pde_residual_all = pde(inputs, outputs)
 
-    # load training (origin) data to use as collocation points
-    data_train = np.load(f"../../../data/diffusion_reaction/dr_train_ls_0.5_101_101.npz")
-    X_train_branch_origin = np.repeat(data_train["X_train0"], 101 * 101, axis=0)
-    X_train_trunk_origin = np.tile(data_train["X_train1"], (1000, 1))
-    y_train_origin = data_train["y_train"].reshape(-1, 1)
+            # 然后只对前面的配点部分计算 loss
+            pde_residual = pde_residual_all[:colloc_count]
 
-    # combine origin collocation points and observed points (observations appended at the end)
-    X_train = (np.concatenate([X_train_branch_origin, X_train_branch_addition], axis=0),
-               np.concatenate([X_train_trunk_origin, X_train_trunk_addition], axis=0))
-    y_train = np.concatenate([y_train_origin, y_train_addition], axis=0)
+            if isinstance(loss_fn, (list, tuple)):
+                pde_loss = loss_fn[0](tf.zeros_like(pde_residual), pde_residual)
+            else:
+                pde_loss = loss_fn(tf.zeros_like(pde_residual), pde_residual)
 
-    X_test = (np.tile(sensor_value, [101*101, 1]),
-              np.array([[a, b] for a in np.linspace(0, 1, 101) for b in np.linspace(0, 1, 101)]))
-    y_test = data_test['y_test'][repeat]
+            # 2. Data loss：只对后面的观测点计算
+            outputs_obs = outputs[colloc_count:]
+            data_residual = outputs_obs - y_obs_tensor
 
-    data = CombinedData(X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test, num_train_obs=num_train)
+            if isinstance(loss_fn, (list, tuple)) and len(loss_fn) > 1:
+                data_loss = loss_fn[1](tf.zeros_like(data_residual), data_residual)
+            else:
+                # 如果没有第二个 loss_fn，使用第一个或默认的
+                if isinstance(loss_fn, (list, tuple)):
+                    data_loss = loss_fn[0](tf.zeros_like(data_residual), data_residual)
+                else:
+                    data_loss = loss_fn(tf.zeros_like(data_residual), data_residual)
 
+            # 3. 应用权重并返回 list
+            weighted_pde_loss = pde_weight * pde_loss
+            weighted_data_loss = data_weight * data_loss
+
+            return [weighted_pde_loss, weighted_data_loss]
+
+    # ===== 启用 combined_losses =====
+    # 替换方法（注意：只替换 losses，train_next_batch 已经在前面替换了）
+    data_pde.losses = combined_losses
+    print("\n✓ 已启用 combined_losses (返回 list 格式)\n")
+
+    # 构建DeepONet
     net = dde.maps.DeepONet(
         [101, 100, 100, 100],
         [2, 100, 100, 100],
         {"branch": "relu", "trunk": gelu},
         "Glorot normal",
-        trainable_branch=trainable_branch,
-        trainable_trunk=trainable_trunk,
+        trainable_branch=True,
+        trainable_trunk=[True, True, True],
     )
 
     net.apply_output_transform(dirichlet)
     net.build()
     net.inputs = [sensor_value, None]
 
-    model = dde.Model(data, net)
+    model = dde.Model(data_pde, net)
+    model.compile("adam", lr=lr, metrics=["l2 relative error"])
 
-    # A placeholder loss_func is passed to compile; the actual combined loss is computed inside
-    # CombinedData.losses, but DeepXDE requires a loss argument for API consistency.
-    def loss_func(y_true, y_pred):
-        return dde.losses.mean_squared_error(y_true, y_pred)
+    # ============ 关键修改：使用 FT_Phys 的方式 ============
+    # 1. 第二次 compile（与 FT_Phys 保持一致）
+    model.compile("adam", lr=lr, metrics=["l2 relative error"])
 
-    iterations = 3000
-    model.compile("adam", lr=lr, loss=loss_func, metrics=["l2 relative error"] ,
-                  decay=("inverse time", iterations // 5, 0.8))
-    model.train(iterations=iterations, display_every=100, batch_size=10000, model_restore_path=model_restore_path)
+    # 2. 训练时 restore（而不是提前 restore）
+    iterations = 200  # 改为与 FT_Phys 一致的 200 步
+    print(f"\n开始Combined训练 (PDE权重={pde_weight}, 数据权重={data_weight}, 迭代={iterations})...")
+    print("✓ 使用 FT_Phys 风格：双 compile + train 中 restore\n")
 
-    return model.predict(X_test).reshape(1, 101*101)
+    losshistory, train_state = model.train(
+        epochs=iterations,
+        display_every=50,
+        model_restore_path=model_restore_path  # 在这里 restore
+    )
+
+    # 测试
+    X_test = (np.tile(sensor_value, [101*101, 1]),
+              np.array([[a, b] for a in np.linspace(0, 1, 101) for b in np.linspace(0, 1, 101)]))
+    y_test = data_test['y_test'][repeat]
+    y_pred = model.predict(X_test)
+
+    error = dde.metrics.l2_relative_error(y_test, y_pred)
+    print(f"\n最终L2相对误差: {error:.6f}")
+
+    return error
 
 
 if __name__ == "__main__":
+    repeat = 0
     ls_test = 0.2
     num_train = 100
-    output_list = []
-    for repeat in range(100):
-        output = apply(combined_train, (repeat, ls_test, num_train))
-        output_list.append(output)
-    output_list = np.concatenate(output_list, axis=0)
-    np.save(f"predict_ft_obs_phys_combined.npy", output_list)
+    model_path = "model/model"
+
+    print("=" * 80)
+    print("Combined方法完整测试")
+    print("=" * 80)
+    print(f"样本: {repeat}, 测试长度尺度: {ls_test}, 观测点数: {num_train}")
+    print("=" * 80)
+
+    # 测试1: 纯 PDE 模式 (data_weight=0)
+    print("\n[测试1] 纯 PDE 模式 (pde_weight=1.0, data_weight=0.0)")
+    print("-" * 80)
+    error_pde = apply(combined_train, (repeat, ls_test, num_train, 1e-3, 1.0, 0.0, model_path))
+    print(f"✓ 纯 PDE 最终误差: {error_pde:.6f}")
+
+    # 测试2: 组合模式 (data_weight=0.3)
+    print("\n[测试2] 组合模式 (pde_weight=1.0, data_weight=0.3)")
+    print("-" * 80)
+    error_combined = apply(combined_train, (repeat, ls_test, num_train, 1e-3, 1.0, 0.3, model_path))
+    print(f"✓ 组合模式最终误差: {error_combined:.6f}")
+
+    # 总结
+    print("\n" + "=" * 80)
+    print("总结对比")
+    print("=" * 80)
+    print(f"纯 PDE 模式:  {error_pde:.6f}")
+    print(f"组合模式:     {error_combined:.6f}")
+    print(f"FT_Phys 基线: 0.008883 (参考)")
+    print("=" * 80)
